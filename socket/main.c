@@ -1,39 +1,32 @@
-#include "shared_memory.h"
+#include "util.h"
 #include <sys/types.h>
 #include <unistd.h>
 #include <syslog.h>
 #include <poll.h>
 #include <errno.h>
-#include <stdio.h>
-#include <fcntl.h>
+#include <sys/socket.h>
 #include <string.h>
-#include <sys/types.h>
 #include <sys/wait.h>
-#include <signal.h>
 #include <time.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <argp.h>
 
-#define SHM_NAME "shm_memory_signal"
-#define FD_BASE 100
-
 char *name[] = {
-    [SMT_CREATER]   = "MAIN",
-    [SMT_WRITER]    = "WRITER",
-    [SMT_READER]    = "READER"
+    [MAIN] =    "MAIN",
+    [WRITER] =  "WRITER",
+    [READER] =  "READER"
 };
 
 struct {
     unsigned message_count;
     unsigned message_size;
-    enum SHARED_MEMORY_TYPE mode;
+    enum TYPE mode;
 } opts = {
-    .message_count = 1,
-    .message_size = 1000,
-    .mode = SMT_CREATER
+    .mode = MAIN
 };
 
-static struct argp_option options[] = {
+struct argp_option options[] = {
     { "count",  'c',    "count",    0,  "" },
     { "size",   's',    "size",     0,  "" },
     { "writer", 'w',    0,          0,  "" },
@@ -41,7 +34,8 @@ static struct argp_option options[] = {
     { 0 }
 };
 
-error_t parse_opt(int key, char *arg, struct argp_state *state) {
+error_t parse_opt(int key, char *arg, struct argp_state *state)
+{
     switch (key) {
     case 's':
         opts.message_size = atoi(arg);
@@ -50,11 +44,11 @@ error_t parse_opt(int key, char *arg, struct argp_state *state) {
         opts.message_count = atoi(arg);
         break;
     case 'w':
-        opts.mode = SMT_WRITER;
+        opts.mode = WRITER;
         openlog(name[opts.mode], LOG_PERROR | LOG_PID, 1);
         break;
     case 'r':
-        opts.mode = SMT_READER;
+        opts.mode = READER;
         openlog(name[opts.mode], LOG_PERROR | LOG_PID, 1);
         break;
     default:
@@ -63,66 +57,64 @@ error_t parse_opt(int key, char *arg, struct argp_state *state) {
     return 0;
 }
 
-static struct argp argp = { .options = options, .parser = parse_opt, .doc = "DOC" };
+struct argp argp = { .options = options, .parser = parse_opt, .doc = "DOC" };
 
 int writer_proc()
 {
-    struct shared_memory writer = {};
-    if (shared_memory_open(&writer, SHM_NAME, opts.message_size, SMT_WRITER)) {
-        syslog(LOG_ERR, "Failed open shm\n");
-        return -1;
-    }
-    char buf[opts.message_size];
-    unsigned iter = 0;
     struct pollfd pfd = {
-        .fd = writer.signalfd
+        .fd = FD_BASE
     };
+    unsigned iter = 0;
+    char buf[opts.message_size];
+    memset(buf, 0, opts.message_size);
+
+    struct timespec start = {};
+    struct timespec end = {};
+    clock_gettime(CLOCK_MONOTONIC, &start);
     do {
-        pfd.events = POLLIN;
+        pfd.events = POLLOUT;
         pfd.revents = 0;
         int rc = poll(&pfd, 1, -1);
         if (rc == -1 && (errno == EINTR)) {
             continue;
         }
-        if (pfd.revents != POLLIN) {
-            syslog(LOG_ERR, "REVENTS is not POLLIN (%i)\n", pfd.revents);
+        if (pfd.revents != POLLOUT) {
+            syslog(LOG_ERR, "REVENTS is not POLLOUT\n");
             return -1;
         }
-        if (pfd.revents & POLLHUP || pfd.revents & POLLERR) {
-            syslog(LOG_ERR, "ERROR: revents %s%s\n",
-                    (pfd.revents & POLLHUP)? "POLLHUP ": "",
-                    (pfd.revents & POLLERR)? "POLLERR": "");
-            return -1;
-        } else if (!(pfd.revents & pfd.events)) {
-            syslog(LOG_ERR, "Get revents: %d\n", pfd.revents);
-        }
-
         snprintf(buf, opts.message_size, "message #%u", iter);
-        int write = shared_memory_write(&writer, (void *)buf, opts.message_size);
-        if (write == 0) {
+        struct iovec vec = {
+            .iov_base = buf,
+            .iov_len = opts.message_size
+        };
+        struct msghdr msg = {
+            .msg_iov = &vec,
+            .msg_iovlen = 1
+        };
+        rc = sendmsg(FD_BASE, &msg, 0);
+        if (rc == 0) {
+            syslog(LOG_ERR, "Failed to write message is BLOCKED\n");
             continue;
         }
-        if (write == -1) {
-            syslog(LOG_ERR, "Failed to write message\n");
+        if (rc == -1) {
+            syslog(LOG_ERR, "Failed to write message: error=%d(%s)\n", errno, strerror(errno));
             return -1;
         }
         iter++;
     } while (iter < opts.message_count);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    timespec_show_info(&start, &end, opts.message_count);
+
     return 0;
 }
 
 int reader_proc()
 {
-    struct shared_memory reader = {};
-    if (shared_memory_open(&reader, SHM_NAME, opts.message_size, SMT_READER)) {
-        syslog(LOG_ERR, "Failed open shm\n");
-        return -1;
-    }
     unsigned iter = 0;
     struct pollfd pfd = {
-        .fd = reader.signalfd
+        .fd = FD_BASE
     };
-    char buf[opts.message_size + 1]; // for end string
+    char buf[opts.message_size + 1];
     memset(buf, 0, opts.message_size + 1);
     struct timespec start = {};
     struct timespec end = {};
@@ -146,28 +138,26 @@ int reader_proc()
         } else if (!(pfd.revents & pfd.events)) {
             syslog(LOG_ERR, "Get revents: %d\n", pfd.revents);
         }
-        int read = shared_memory_read(&reader, (void *)buf, opts.message_size);
-        if (read == 0) {
-            continue;
+        struct iovec vec = {
+            .iov_base = buf,
+            .iov_len = opts.message_size
+        };
+        struct msghdr msg = {
+            .msg_iov = &vec,
+            .msg_iovlen = 1
+        };
+        rc = recvmsg(FD_BASE, &msg, 0);
+        if (rc == 0) {
+            syslog(LOG_ERR, "Failed to read message is BLOCKED\n");
         }
-        if (read == -1) {
-            syslog(LOG_ERR, "Failed to read message\n");
+        if (rc == -1) {
+            syslog(LOG_ERR, "Failed to read message: error=%d(%s)\n", errno, strerror(errno));
             return -1;
         }
         iter++;
     } while (iter < opts.message_count);
     clock_gettime(CLOCK_MONOTONIC, &end);
-    struct timespec diff = {};
-    if (start.tv_nsec > end.tv_nsec) {
-        end.tv_sec -= 1;
-        diff.tv_nsec = 1000000000 + end.tv_nsec - start.tv_nsec;
-    } else {
-        diff.tv_nsec = end.tv_nsec - start.tv_nsec;
-    }
-    diff.tv_sec = end.tv_sec - start.tv_sec;
-    syslog(LOG_ERR, "TIME: sec: %lu, nanosec: %lu\n", diff.tv_sec, diff.tv_nsec);
-    syslog(LOG_ERR, "LAST MESSAGE: \"%s\"\n", buf);
-
+    timespec_show_info(&start, &end, opts.message_count);
     return 0;
 }
 
@@ -179,19 +169,21 @@ int main(int argc, char *argv[])
         syslog(LOG_ERR, "message size and message count must be greater than zero\n");
         return -1;
     }
-    if (opts.mode == SMT_READER) {
+    if (opts.mode == READER) {
         reader_proc();
         return 0;
     }
-    if (opts.mode == SMT_WRITER) {
+    if (opts.mode == WRITER) {
         writer_proc();
         return 0;
     }
 
-    struct shared_memory sh_mem = {};
-    if (shared_memory_init(&sh_mem, SHM_NAME, opts.message_size) == -1) {
+    int fds[2] = {};
+    if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, fds)) {
+        syslog(LOG_ERR, "FAILED\n");
         return -1;
     }
+
     char size[NAME_MAX] = {};
     snprintf(size, NAME_MAX, "%u", opts.message_size);
     char count[NAME_MAX] = {};
@@ -199,6 +191,7 @@ int main(int argc, char *argv[])
     pid_t pid = fork();
     switch (pid) {
     case 0:
+        dup2(fds[0], FD_BASE);
         // Execute reader
         if (execl(argv[0], argv[0], "--reader", "--size", size, "--count", count, NULL)) {
             syslog(LOG_ERR, "failed exec\n");
@@ -207,14 +200,14 @@ int main(int argc, char *argv[])
         break;
     case -1:
         syslog(LOG_ERR, "Failed to call fork\n");
-        shared_memory_deinit(&sh_mem);
+        close(fds[0]);
+        close(fds[1]);
         return -1;
-    default:
-        shared_memory_set_pid_glob(&sh_mem, pid, SMT_READER);
     }
     pid = fork();
     switch (pid) {
     case 0:
+        dup2(fds[1], FD_BASE);
         // Execute writer
         if (execl(argv[0], argv[0], "--writer", "--size", size, "--count", count, NULL)) {
             syslog(LOG_ERR, "failed exec\n");
@@ -223,16 +216,15 @@ int main(int argc, char *argv[])
         break;
     case -1:
         syslog(LOG_ERR, "Failed to call fork\n");
-        shared_memory_deinit(&sh_mem);
+        close(fds[0]);
+        close(fds[1]);
         return -1;
-        break;
-    default:
-        shared_memory_set_pid_glob(&sh_mem, pid, SMT_WRITER);
     }
 
     int status = 0;
     wait(&status);
     wait(&status);
-    shared_memory_deinit(&sh_mem);
+    close(fds[0]);
+    close(fds[1]);
     return 0;
 }
